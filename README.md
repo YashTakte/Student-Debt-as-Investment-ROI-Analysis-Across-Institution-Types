@@ -82,4 +82,5 @@ The models explain approximately **18-22% of earnings variation**, highlighting 
 ## Acknowledgments
 
 Data provided by the U.S. Department of Education College Scorecard.
+
 This project was completed for academic purposes as part of coursework.
