@@ -1,0 +1,1395 @@
+---
+title: "Student Debt as Investment: ROI Analysis Across Institution Types"
+author: "Yash Takte & Meryl Sarah Jacob"
+date: ''
+output:
+  pdf_document:
+    latex_engine: xelatex
+  html_document: default
+subtitle: S470/670 · Fall 2025
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE)
+
+# Load Libraries
+library(tidyverse)
+library(broom)
+library(scales)
+library(GGally)
+library(skimr)
+library(knitr)
+library(dplyr)
+library(tibble)
+library(patchwork)
+library(mgcv)
+library(MASS)
+library(scales)
+library(stringr)
+library(viridis)
+library(ggrepel)
+
+# --- Colorblind-Friendly Palette ---
+cb_palette <- c("#999999", "#E69F00", "#56B4E9", "#CC79A7", "#009E73",
+                "#F0E442", "#0072B2", "#D55E00")
+
+# Institution Type Colors
+institution_colors <- c(
+  "Public"            = "#0072B2",  # Blue
+  "Private Nonprofit" = "#CC79A7",  # Reddish Purple
+  "For-Profit"        = "#E69F00"   # Orange
+)
+
+# Graduation Rate Tier Colors
+grad_tier_colors <- c(
+  "Low Graduation (<50%)"      = "#D55E00",  # Vermillion
+  "Medium Graduation (50-70%)" = "#E69F00",  # Orange
+  "High Graduation (≥70%)"     = "#009E73"   # Bluish Green
+)
+
+# Trend Line Colors
+trend_colors <- c(
+  "Linear (LM)"    = "#D55E00",  # Vermillion
+  "Flexible (GAM)" = "#0072B2",  # Blue
+  "Robust GAM"     = "#0072B2",  # Blue
+  "OLS"            = "#D55E00",
+  "Huber"          = "#0072B2",
+  "Tukey"          = "#009E73"
+)
+
+# Highlight Colors
+highlight_negative <- "#D55E00"  # For negative trends
+highlight_positive <- "#009E73"  # For positive trends
+highlight_neutral  <- "#999999"  # Gray
+```
+
+## 1. Introduction and Statement of Goals
+
+This study addresses the main question faced by prospective college students and policy makers: **How does student debt as an investment affect earnings, and does this ROI relationship vary across institution types (public or private nonprofit) and institutional quality (graduation rates)?**
+
+We focus on two institutional dimensions that prior research and policies suggest are critical factors that influence debt. First, is 'Institution Type: Public vs Private nonprofit'. These represent the different funding models, cost structures and student population. These two different types of institutions may produce distinct debt-earning patterns. Second, is 'Institutional Quality'. This is captured through 6-year graduation rates which measure an institution's effectiveness at helping students complete degrees. Degree completion is traditionally the main gateway to labor market returns.
+
+Understanding the debt-earnings relationship helps prospective students and families make consequential financial decisions. Conventionally, the advice is to minimize debts at all costs, potentially steering students towards lower-cost institutions with weaker completion rates and employment outcomes. If our analysis reveals that moderate debt at high-graduation-rate schools produces better outcomes than minimal debt at struggling schools, this advice may be misguided. Conversely, if we find danger zones where borrowing doesn't translate to earnings gains, students can avoid these combinations.
+
+For policy makers, federal student loan policy currently treats all bachelor's degree programs similarly, i.e. undergraduates can borrow up to $31,000 in federal Stafford loans regardless of institutional quality, program of study or expected outcomes. If the debt-earnings relationship varies by institution type and quality, a one-size-fits-all policy may be inefficient. These policies could be then tailored to institutional characteristics and outcomes.
+
+```{r Data Loading}
+# Define Missing Values
+na_vals <- c("NA", "PS")
+
+# Read the raw data
+scorecard_raw <- read_csv("Most-Recent-Cohorts-Institution_05192025.csv", na = na_vals, show_col_types = FALSE)
+```
+
+## 2. Data Description
+
+### 2.1 Data Source and Variables
+
+**Data Source:** The U.S. Department of Education, College Scorecard (https://collegescorecard.ed.gov/data/)
+
+**Data:** https://ed-public-download.scorecard.network/downloads/Most-Recent-Cohorts-Institution_05192025.zip (Data retrieved December 9, 2025)
+
+We use data from the Official Federal database of college performance and student outcomes which includes the most recent Institution-Level Data (this file contained information about debt and earnings). To this data we applied several filters to narrow it down for our problem statement. We finally chose 1,430 bachelor's degree-granting institutions (filtered from 6,429 total). These represented most U.S. four-year colleges. 1,430 institutions are distributed as Private Nonprofit (889 or 62.2%), Public (507 or 35.5%), and For-Profit (34 or 2.4%). We also narrow down the control variables and drop the rest.
+
+```{r Data Cleaning & Preparation}
+# Create the cleaned dataset with key variables
+scorecard_clean <- scorecard_raw %>%
+  filter(ICLEVEL == 1) %>%
+  dplyr::select(
+    INSTNM, UNITID,
+    MD_EARN_WNE_1YR, GRAD_DEBT_MDN, CONTROL, STABBR,
+    C150_4, ADM_RATE, UGDS, FTFTPCTPELL, TUITIONFEE_IN, PREDDEG
+  ) %>%
+  filter(
+    !is.na(MD_EARN_WNE_1YR), !is.na(GRAD_DEBT_MDN),
+    !is.na(CONTROL), !is.na(STABBR)
+  ) %>%
+  rename(
+    name = INSTNM, institution_id = UNITID,
+    earnings = MD_EARN_WNE_1YR, debt = GRAD_DEBT_MDN,
+    control = CONTROL, state = STABBR,
+    grad_rate = C150_4, admit_rate = ADM_RATE,
+    size = UGDS, pct_pell = FTFTPCTPELL,
+    tuition = TUITIONFEE_IN, pred_degree = PREDDEG
+  ) %>%
+  mutate(
+    control_label = case_when(
+      control == 1 ~ "Public",
+      control == 2 ~ "Private Nonprofit",
+      control == 3 ~ "For-Profit",
+      TRUE ~ NA_character_
+    ),
+    control_label = factor(control_label, levels = c("Public", "Private Nonprofit", "For-Profit")),
+    
+    region = case_when(
+      state %in% c("CT", "ME", "MA", "NH", "RI", "VT", "NJ", "NY", "PA") ~ "Northeast",
+      state %in% c("IL", "IN", "MI", "OH", "WI", "IA", "KS", "MN", "MO", 
+                   "NE", "ND", "SD") ~ "Midwest",
+      state %in% c("DE", "FL", "GA", "MD", "NC", "SC", "VA", "WV", "AL", 
+                   "KY", "MS", "TN", "AR", "LA", "OK", "TX", "DC") ~ "South",
+      state %in% c("AZ", "CO", "ID", "MT", "NV", "NM", "UT", "WY", "AK", 
+                   "CA", "HI", "OR", "WA") ~ "West",
+      state %in% c("PR", "VI", "GU", "AS", "MP") ~ "Territories",
+      TRUE ~ NA_character_
+    ),
+    region = factor(region, levels = c("Northeast", "Midwest", "South", "West")),
+    
+    grad_rate_category = case_when(
+      is.na(grad_rate) ~ NA_character_,
+      grad_rate < 0.40 ~ "Low Graduation (<40%)",
+      grad_rate < 0.60 ~ "Medium Graduation (40-60%)",
+      grad_rate < 0.75 ~ "High Graduation (60-75%)",
+      grad_rate >= 0.75 ~ "Very High Graduation (≥75%)",
+      TRUE ~ NA_character_
+    ),
+    grad_rate_category = factor(grad_rate_category, 
+                                levels = c("Low Graduation (<40%)", "Medium Graduation (40-60%)", 
+                                          "High Graduation (60-75%)", "Very High Graduation (≥75%)")),
+    
+    debt_to_earnings = debt / earnings,
+    log_earnings = log(earnings),
+    log_debt = log(debt),
+    log_size = log(size)
+  )
+
+# CASE ANALYSIS DATASET
+scorecard_complete <- scorecard_clean %>%
+  filter(
+    !is.na(region), region != "Territories",
+    !is.na(grad_rate), !is.na(admit_rate), !is.na(pct_pell),
+    !is.na(pred_degree), pred_degree == 3
+  )
+
+# Create graduation categories
+scorecard_complete <- scorecard_complete %>%
+  mutate(
+    grad_category = case_when(
+      grad_rate < 0.5 ~ "Low Graduation (<50%)",
+      grad_rate < 0.7 ~ "Medium Graduation (50-70%)",
+      grad_rate >= 0.7 ~ "High Graduation (≥70%)"
+    ),
+    grad_category = factor(grad_category,
+                           levels = c("Low Graduation (<50%)",
+                                      "Medium Graduation (50-70%)",
+                                      "High Graduation (≥70%)"))
+  )
+```
+
+```{r Dataset Summary Part 1}
+# Data Cleaning Summary 
+cleaning_summary_df <- tibble::tribble(
+  ~Step, ~Institutions,
+  "Original dataset", nrow(scorecard_raw),
+  "After filtering (4-year only)", nrow(scorecard_raw %>% filter(ICLEVEL == 1)),
+  "After removing missing data", nrow(scorecard_clean),
+  "Final complete case dataset", nrow(scorecard_complete)
+)
+kable(
+  cleaning_summary_df,
+  col.names = c("Data Cleaning Step", "Number of Institutions"),
+  caption = "Data Cleaning Summary",
+  format.args = list(big.mark = ",")
+)
+
+# Filtering Criteria 
+criteria_df <- tibble::tribble(
+  ~Number, ~Criterion,
+  "1.", "4-year institutions (ICLEVEL = 1)",
+  "2.", "Predominantly bachelor's degree granting (PREDDEG = 3)",
+  "3.", "Complete earnings and debt data",
+  "4.", "Complete control variables (graduation rate, admission rate, % Pell)",
+  "5.", "Mainland U.S. only (excludes territories)"
+)
+kable(
+  criteria_df,
+  col.names = c("", "Criterion"),
+  caption = "Filtering Criteria (Final Dataset)",
+  align = 'lr'
+)
+
+# Distribution by Institution Type
+scorecard_complete %>%
+  count(control_label, name = "Count") %>%
+  mutate(Percentage = (Count / sum(Count)) * 100) %>%
+  kable(
+    col.names = c("Institution Type", "Count", "Percentage (%)"),
+    caption = "Distribution by Institution Type (Final Dataset)",
+    digits = c(0, 0, 1),
+    align = 'lrr'
+  )
+```
+
+### 2.2 Variable Definitions
+
+The key variables (control variables) are:
+
+- Median Debt at Graduation - Median Federal loan debt at graduation
+
+- Median Earnings (1 Year After) - Median Income one year after graduation
+
+- Graduation Rate - Percentage of students completing their degree within 6 years
+
+- Institution Type - Public, Private Nonprofit, or For-Profit
+
+```{r Dataset Summary Part 2}
+# Key Continuous Variable Ranges
+variable_ranges_df <- tibble::tribble(
+  ~Variable, ~Min, ~Max, ~Median,
+  "Earnings (1yr)",
+    scales::dollar(min(scorecard_complete$earnings)),
+    scales::dollar(max(scorecard_complete$earnings)),
+    scales::dollar(median(scorecard_complete$earnings)),
+  "Debt",
+    scales::dollar(min(scorecard_complete$debt)),
+    scales::dollar(max(scorecard_complete$debt)),
+    scales::dollar(median(scorecard_complete$debt)),
+  "Graduation Rate",
+    scales::percent(min(scorecard_complete$grad_rate, na.rm = TRUE), accuracy = 0.1),
+    scales::percent(max(scorecard_complete$grad_rate, na.rm = TRUE), accuracy = 0.1),
+    scales::percent(median(scorecard_complete$grad_rate, na.rm = TRUE), accuracy = 0.1)
+)
+kable(
+  variable_ranges_df,
+  caption = "Key Continuous Variable Ranges (Final Dataset)",
+  align = 'lrrr'
+)
+```
+
+### 2.3 Understanding Data Artifacts
+
+Before analyzing relationships, we must understand borrowing constraints. About three-fourths of private nonprofit student debt clusters at the $25K-$27K federal Stafford loan limit. On the other hand, public schools show a lower debt of about $21K. This clustering indicates the federal policy creating a ceiling on borrowing for many dependent undergraduate students. 
+
+```{r Debt Clustering Analysis, fig.width=10, fig.height=6}
+# Understanding clustering at $25-27K
+
+debt_histogram <- ggplot(scorecard_complete, aes(x = debt)) +
+  geom_histogram(binwidth = 500, fill = cb_palette[6], alpha = 0.7, color = "white") +
+  geom_vline(xintercept = c(25000, 26000, 27000), 
+             color = highlight_negative, linetype = "dashed", linewidth = 1) +
+  annotate("text", x = 26000, y = Inf, 
+           label = "Federal Loan Limits\n($25K-$27K)", 
+           vjust = 2, color = highlight_negative, fontface = "bold", size = 4) +
+  scale_x_continuous(labels = dollar_format()) +
+  labs(
+    title = "Student Debt Distribution Shows Clustering at Federal Loan Limits",
+    subtitle = "Spikes at $25K-$27K reflect Stafford Loan aggregate limits for dependent undergraduates",
+    x = "Median Debt at Graduation",
+    y = "Number of Institutions"
+  ) +
+  theme_minimal(base_size = 13)
+
+debt_histogram
+```
+
+```{r Debt by Institution Type, fig.width=10, fig.height=6}
+# QUANTITATIVE EVIDENCE for the subtitle claim
+debt_summary <- scorecard_complete %>%
+  group_by(control_label) %>%
+  summarise(
+    N = n(),
+    `Median Debt` = median(debt),
+    `% Between $22K-$32K` = round(sum(debt >= 22000 & debt <= 32000) / n() * 100, 1),
+    `% Above $30K` = round(sum(debt > 30000) / n() * 100, 1),
+    .groups = "drop"
+  ) %>%
+  mutate(`Median Debt` = dollar(`Median Debt`))
+
+kable(
+  debt_summary,
+  caption = "Debt Clustering Patterns by Institution Type",
+  align = c('l', 'r', 'r', 'r', 'r')
+)
+```
+
+## 3. Exploratory Data Analysis
+
+### 3.1 Assessing the Need for Nonlinear Models
+
+```{r Linearity Assessment Plots, fig.width=12, fig.height=13}
+# TEAMMATE SUGGESTION: Show linearity check with curves
+
+# Plot 1: Debt vs Graduation Rate
+p1 <- ggplot(scorecard_complete, aes(x = grad_rate, y = debt)) +
+  geom_point(alpha = 0.4, color = "gray50", size = 2) +
+  geom_smooth(method = "lm", se = FALSE, 
+              color = trend_colors["Linear (LM)"], 
+              linewidth = 1.2, linetype = "dashed") +
+  geom_smooth(method = "loess", se = TRUE, 
+              color = trend_colors["Flexible (GAM)"],
+              fill = trend_colors["Flexible (GAM)"],
+              alpha = 0.2, linewidth = 1.5) +
+  scale_x_continuous(labels = percent_format()) +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(
+    title = "A. Debt vs Graduation Rate",
+    subtitle = "Comparing linear fit (dashed) to flexible smooth curve (solid)",
+    x = "Graduation Rate",
+    y = "Median Debt at Graduation"
+  ) +
+  theme_minimal(base_size = 13)
+
+# Plot 2: Earnings vs Graduation Rate
+p2 <- ggplot(scorecard_complete, aes(x = grad_rate, y = earnings)) +
+  geom_point(alpha = 0.4, color = "gray50", size = 2) +
+  geom_smooth(method = "lm", se = FALSE, 
+              color = trend_colors["Linear (LM)"], 
+              linewidth = 1.2, linetype = "dashed") +
+  geom_smooth(method = "loess", se = TRUE, 
+              color = trend_colors["Flexible (GAM)"],
+              fill = trend_colors["Flexible (GAM)"],
+              alpha = 0.2, linewidth = 1.5) +
+  scale_x_continuous(labels = percent_format()) +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(
+    title = "B. Earnings vs Graduation Rate",
+    subtitle = "Comparing linear fit (dashed) to flexible smooth curve (solid)",
+    x = "Graduation Rate",
+    y = "Median Earnings (1 Year After)"
+  ) +
+  theme_minimal(base_size = 13)
+
+# Plot 3: Debt vs Earnings
+p3 <- ggplot(scorecard_complete, aes(x = debt, y = earnings)) +
+  geom_point(alpha = 0.4, color = "gray50", size = 2) +
+  geom_smooth(method = "lm", se = FALSE, 
+              color = trend_colors["Linear (LM)"], 
+              linewidth = 1.2, linetype = "dashed") +
+  geom_smooth(method = "loess", se = TRUE, 
+              color = trend_colors["Flexible (GAM)"],
+              fill = trend_colors["Flexible (GAM)"],
+              alpha = 0.2, linewidth = 1.5) +
+  scale_x_continuous(labels = dollar_format()) +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(
+    title = "C. Debt vs Earnings",
+    subtitle = "Comparing linear fit (dashed) to flexible smooth curve (solid)",
+    x = "Median Debt at Graduation",
+    y = "Median Earnings (1 Year After)"
+  ) +
+  theme_minimal(base_size = 13)
+
+(p1 / p2 / p3) +
+  plot_annotation(
+    title = "Assessing Linearity: Do We Need Nonlinear Models?",
+    subtitle = "Dashed line = Linear fit | Solid curve = Flexible smooth | Deviation indicates nonlinearity",
+    theme = theme(
+      plot.title = element_text(face = "bold", size = 15),
+      plot.subtitle = element_text(size = 11)
+    )
+  )
+```
+
+The graphs above check to see if we need complex models, or will simple straight lines suffice. We compare linear fits (dashed) to flexible smooth curves (solid). In Panel B (Earnings vs Graduation Rate), the smooth curve reveals a steepening relationship; graduation rate matters more at higher levels. We see a steady increase in the relationship after a point. In Panel C (Debt vs Earnings), the smooth curve shows a subtle U-shape that a straight line misses entirely. These deviations indicate that linear models will miss important structure in the data.
+
+### 3.2 Key Predictors of Earnings
+
+```{r Earnings Predictors, fig.width=7, fig.height=4}
+earnings_focused <- scorecard_complete %>%
+  dplyr::select(earnings, debt, grad_rate) %>%
+  pivot_longer(
+    cols = c(debt, grad_rate),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  mutate(
+    variable_label = case_when(
+      variable == "debt" ~ "Student Debt ($)",
+      variable == "grad_rate" ~ "Graduation Rate (%)"
+    ),
+    variable_label = factor(variable_label, 
+                           levels = c("Student Debt ($)", "Graduation Rate (%)")),
+    value_display = case_when(
+      variable == "debt" ~ value,
+      variable == "grad_rate" ~ value * 100
+    ),
+    corr = case_when(
+      variable == "debt" ~ round(cor(scorecard_complete$debt, scorecard_complete$earnings), 3),
+      variable == "grad_rate" ~ round(cor(scorecard_complete$grad_rate, scorecard_complete$earnings), 3)
+    ),
+    variable_with_corr = paste0(variable_label, " | r = ", corr)
+  )
+
+ggplot(earnings_focused, aes(x = value_display, y = earnings)) +
+  geom_point(alpha = 0.5, color = "gray50", size = 2.5) +
+  geom_smooth(method = "lm", se = TRUE, color = highlight_negative, 
+              fill = highlight_negative, alpha = 0.2, linewidth = 1.2) +
+  facet_wrap(~variable_with_corr, scales = "free_x", ncol = 2) +
+  scale_y_continuous(labels = dollar_format()) +
+  scale_x_continuous(labels = comma_format()) +
+  labs(
+    title = "Key Predictors of Post-Graduation Earnings",
+    subtitle = "Correlation coefficient (r) and units shown in each panel",
+    x = "Predictor Variable Value",
+    y = "Median Earnings (1 Year After Graduation)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.margin = margin(t = 5.5, r = 5.5, b = 5.5, l = 25),
+    plot.title = element_text(face = "bold", size = 14, margin = margin(b = 5)),
+    plot.subtitle = element_text(size = 11, color = "gray30", margin = margin(b = 10)),
+    strip.text = element_text(face = "bold", size = 10, hjust = 0),
+    strip.background = element_rect(fill = "gray95", color = "gray60", linewidth = 0.5),
+    panel.border = element_rect(color = "gray60", fill = NA, linewidth = 0.5),
+    panel.spacing = unit(2, "lines"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+Across all 1,430 institutions, graduation rate correlates at just r=0.234 with earnings, while debt shows a weakly negative r=-0.13. These anemic correlations might suggest neither factor has a large effect. But aggregating across all school types might obscure critical differences.
+
+### 3.3 The Role of Graduation Rate
+
+```{r Graduation Rate Tiers, fig.width=12, fig.height=5}
+# Compute correlations for each category
+grad_correlations <- scorecard_complete %>%
+  group_by(grad_category) %>%
+  summarise(corr = round(cor(debt, earnings), 3), .groups = "drop")
+
+scorecard_with_corr <- scorecard_complete %>%
+  left_join(grad_correlations, by = "grad_category") %>%
+  mutate(
+    facet_label = paste0(grad_category, " | r = ", corr),
+    facet_label = factor(facet_label,
+                         levels = paste0(levels(grad_category), " | r = ", 
+                                         grad_correlations$corr))
+  )
+
+ggplot(scorecard_with_corr, aes(x = debt, y = earnings)) +
+  geom_point(alpha = 0.5, color = "gray50", size = 2.5) +
+  geom_smooth(method = "lm", se = TRUE, color = highlight_negative,
+              fill = highlight_negative, alpha = 0.2, linewidth = 1.2) +
+  facet_wrap(~facet_label, ncol = 3) +
+  scale_x_continuous(labels = dollar_format()) +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(
+    title = "Debt-Earnings Relationship by Graduation Rate",
+    subtitle = "Debt-earnings correlation by graduation rate quartile and institution type",
+    x = "Median Debt at Graduation",
+    y = "Median Earnings (1 Year After Graduation)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 15),
+    plot.subtitle = element_text(size = 11, color = "gray30"),
+    strip.text = element_text(face = "bold", size = 11, hjust = 0),
+    strip.background = element_rect(fill = "gray95", color = "gray60"),
+    panel.border = element_rect(color = "gray60", fill = NA),
+    panel.spacing = unit(2, "lines")
+  )
+
+scorecard_complete %>%
+  group_by(grad_category) %>%
+  summarise(
+    N = n(),
+    Correlation = round(cor(debt, earnings), 3)
+  ) %>%
+  kable(
+    caption = "Debt-Earnings Correlation by Graduation Rate Tier",
+    align = c('l', 'r', 'r')
+  )
+```
+
+To examine whether the debt–earnings relationship varies by institutional quality, we stratified institutions into three graduation-rate tiers (<50%, 50–70%, ≥70%) and fit separate linear models within each group. If debt had a uniform association with earnings, slopes would be similar across tiers. Instead, we observe substantial heterogeneity, including a reversal in the direction of the relationship across graduation tiers, indicating a clear interaction between debt and institutional quality.
+
+This pattern reversal motivates our analytical approach: a single linear model assuming a constant debt effect is inappropriate. The data requires flexible models capable of capturing interaction and nonlinearity. Accordingly, we employ Generalized Additive Models (GAMs) to model these context-dependent relationships while limiting overfitting.
+
+## 4. Model Development and Selection
+
+We fit sector-specific GAMs using log-transformed earnings and debt to handle skewness and proportional relationships. We used scaled t-distributions (family=scat) for outlier resistance and REML for smoothing parameter selection. For each sector, we tested three specifications: (A) separate smooths for debt and graduation rate, (B) smooth debt with linear graduation rate, and (C) interaction surfaces.
+
+```{r Prepare Modeling Data}
+# Separate datasets for Public and Private
+data_public <- scorecard_complete %>%
+  filter(control_label == "Public") %>%
+  mutate(
+    log_earnings = log(earnings),
+    log_debt = log(debt)
+  )
+
+data_private <- scorecard_complete %>%
+  filter(control_label == "Private Nonprofit") %>%
+  mutate(
+    log_earnings = log(earnings),
+    log_debt = log(debt)
+  )
+```
+
+### 4.1 GAM Model Variants
+
+```{r Fit GAM Models}
+# PUBLIC MODELS
+gam_public_bs <- gam(
+  log_earnings ~ s(log_debt, k = 10) + s(grad_rate, k = 10),
+  data = data_public,
+  family = scat(link = "identity"),
+  method = "REML"
+)
+
+gam_public_grl <- gam(
+  log_earnings ~ s(log_debt, k = 10) + grad_rate,
+  data = data_public,
+  family = scat(link = "identity"),
+  method = "REML"
+)
+
+gam_public_int <- gam(
+  log_earnings ~ s(log_debt, grad_rate, k = 20),
+  data = data_public,
+  family = scat(link = "identity"),
+  method = "REML"
+)
+
+# PRIVATE MODELS
+gam_private_bs <- gam(
+  log_earnings ~ s(log_debt, k = 10) + s(grad_rate, k = 10),
+  data = data_private,
+  family = scat(link = "identity"),
+  method = "REML"
+)
+
+gam_private_grl <- gam(
+  log_earnings ~ s(log_debt, k = 10) + grad_rate,
+  data = data_private,
+  family = scat(link = "identity"),
+  method = "REML"
+)
+
+gam_private_int <- gam(
+  log_earnings ~ s(log_debt, grad_rate, k = 20),
+  data = data_private,
+  family = scat(link = "identity"),
+  method = "REML"
+)
+```
+
+```{r Model Comparison}
+comparison_table <- tibble(
+  Sector = rep(c("Public", "Private Nonprofit"), each = 3),
+  Model = rep(c("Option A: Both Smooth (Debt & Grad Rate)", 
+                "Option B: Debt Smooth, Grad Linear", 
+                "Option C: Interaction Surface"), 2),
+  AIC = c(
+    AIC(gam_public_bs), AIC(gam_public_grl), AIC(gam_public_int),
+    AIC(gam_private_bs), AIC(gam_private_grl), AIC(gam_private_int)
+  ),
+  `Dev. Explained` = c(
+    round(summary(gam_public_bs)$dev.expl * 100, 1),
+    round(summary(gam_public_grl)$dev.expl * 100, 1),
+    round(summary(gam_public_int)$dev.expl * 100, 1),
+    round(summary(gam_private_bs)$dev.expl * 100, 1),
+    round(summary(gam_private_grl)$dev.expl * 100, 1),
+    round(summary(gam_private_int)$dev.expl * 100, 1)
+  ),
+  `R²` = c(  
+    round(summary(gam_public_bs)$r.sq, 3),
+    round(summary(gam_public_grl)$r.sq, 3),
+    round(summary(gam_public_int)$r.sq, 3),
+    round(summary(gam_private_bs)$r.sq, 3),
+    round(summary(gam_private_grl)$r.sq, 3),
+    round(summary(gam_private_int)$r.sq, 3)
+  )
+) %>%
+  group_by(Sector) %>%
+  mutate(`ΔAIC` = AIC - min(AIC)) %>%
+  ungroup() 
+
+kable(
+  comparison_table,
+  caption = "Model Comparison: Which Option is Best?",
+  digits = c(0, 0, 1, 1, 3, 1, 0),
+  align = c('l', 'l', 'r', 'r', 'r', 'r', 'c')
+)
+```
+
+For public institutions, the interaction surface (Option C) won decisively, explaining 22.2% of deviance. This interaction model captures how debt's effect changes at different graduation rates, which is essential for public schools where the reversal pattern was strongest. For private nonprofits, separate smooths (Option A) performed slightly better than the interaction, suggesting additive rather than interactive effects. These model selections aren't arbitrary, but they reflect fundamentally different data-generating processes across sectors.
+
+### 4.2 Addressing Overfitting Concerns
+
+```{r Cross Validation, fig.width=12, fig.height=3}
+# PROFESSOR FEEDBACK: Show model doesn't over fit
+
+cv_gam <- function(data, formula, k_folds = 10) {
+  set.seed(123)
+  data$fold <- sample(1:k_folds, nrow(data), replace = TRUE)
+  cv_results <- data.frame()
+  
+  for(i in 1:k_folds) {
+    train_data <- data[data$fold != i, ]
+    test_data <- data[data$fold == i, ]
+    model <- gam(formula, data = train_data, family = scat(link = "identity"), method = "REML")
+    predictions <- predict(model, newdata = test_data)
+    rmse <- sqrt(mean((exp(test_data$log_earnings) - exp(predictions))^2, na.rm = TRUE))
+    
+    cv_results <- rbind(cv_results, data.frame(fold = i, rmse = rmse))
+  }
+  return(cv_results)
+}
+
+public_cv <- cv_gam(data_public, log_earnings ~ s(log_debt, grad_rate, k = 20), k_folds = 10)
+private_cv <- cv_gam(data_private, log_earnings ~ s(log_debt, k = 10) + s(grad_rate, k = 10), k_folds = 10)
+
+p_cv_public <- ggplot(public_cv, aes(x = fold, y = rmse)) +
+  geom_line(color = institution_colors["Public"], linewidth = 1.2) +
+  geom_point(color = institution_colors["Public"], size = 3) +
+  geom_hline(yintercept = mean(public_cv$rmse), linetype = "dashed", color = highlight_negative) +
+  annotate("text", x = 5, y = mean(public_cv$rmse), 
+           label = paste0("Mean RMSE: ", scales::dollar(round(mean(public_cv$rmse)))),
+           vjust = -0.5, fontface = "bold") +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(
+    title = "A. PUBLIC: 10-Fold Cross-Validation",
+    subtitle = "Root mean squared error across 10 cross-validation folds",
+    x = "Fold Number",
+    y = "RMSE"
+  ) +
+  theme_minimal(base_size = 12)
+
+p_cv_private <- ggplot(private_cv, aes(x = fold, y = rmse)) +
+  geom_line(color = institution_colors["Private Nonprofit"], linewidth = 1.2) +
+  geom_point(color = institution_colors["Private Nonprofit"], size = 3) +
+  geom_hline(yintercept = mean(private_cv$rmse), linetype = "dashed", color = highlight_negative) +
+  annotate("text", x = 5, y = mean(private_cv$rmse), 
+           label = paste0("Mean RMSE: ", scales::dollar(round(mean(private_cv$rmse)))),
+           vjust = -0.5, fontface = "bold") +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(
+    title = "B. PRIVATE: 10-Fold Cross-Validation",
+    subtitle = "Root mean squared error across 10 cross-validation folds",
+    x = "Fold Number",
+    y = "RMSE"
+  ) +
+  theme_minimal(base_size = 12)
+
+p_cv_public | p_cv_private
+
+# Create CV summary table
+cv_summary <- tibble(
+  Sector = c("Public", "Private Nonprofit"),
+  `Mean RMSE` = c(
+    scales::dollar(round(mean(public_cv$rmse))),
+    scales::dollar(round(mean(private_cv$rmse)))
+  ),
+  `SD of RMSE` = c(
+    scales::dollar(round(sd(public_cv$rmse))),
+    scales::dollar(round(sd(private_cv$rmse)))
+  ),
+  `CV (%)` = c(
+    round(sd(public_cv$rmse) / mean(public_cv$rmse) * 100, 1),
+    round(sd(private_cv$rmse) / mean(private_cv$rmse) * 100, 1)
+  )
+)
+
+kable(
+  cv_summary,
+  caption = "Cross-Validation Results: Model Stability Across Folds",
+  align = c('l', 'r', 'r', 'r')
+)
+```
+
+Because our models are relatively complex, overfitting was a concern. We evaluated generalization using 10-fold cross-validation, repeatedly training on 90% of the data and testing on the remaining 10%. The public-school model shows stable performance with an average RMSE of $7,717, while the private-school model has a higher average RMSE of $12,719. The low variability in error across folds indicates good generalization. The higher error for private institutions reflects greater sector heterogeneity rather than model instability.
+
+## 5. Results
+
+### 5.1 Model Validation
+
+```{r Calculate Predictions}
+data_public$predicted_log <- predict(gam_public_int, newdata = data_public)
+data_public$predicted <- exp(data_public$predicted_log)
+data_public$residual <- data_public$earnings - data_public$predicted
+
+data_private$predicted_log <- predict(gam_private_bs, newdata = data_private)
+data_private$predicted <- exp(data_private$predicted_log)
+data_private$residual <- data_private$earnings - data_private$predicted
+```
+
+```{r Observed vs Predicted, fig.width=12, fig.height=6}
+public_rsq <- cor(data_public$earnings, data_public$predicted)^2
+private_rsq <- cor(data_private$earnings, data_private$predicted)^2
+
+p1 <- ggplot(data_public, aes(x = predicted, y = earnings)) +
+  geom_point(alpha = 0.4, color = institution_colors["Public"], size = 2) +
+  geom_abline(slope = 1, intercept = 0, color = highlight_negative, linetype = "dashed", linewidth = 1.5) +
+  geom_smooth(method = "gam", se = TRUE, color = "black", linewidth = 1) +
+  annotate("text", x = min(data_public$predicted) + 2000, y = max(data_public$earnings) - 5000,
+           label = paste0("R² = ", round(public_rsq, 3)),
+           hjust = 0, vjust = 1, size = 5, fontface = "bold", color = institution_colors["Public"]) +
+  scale_x_continuous(labels = dollar_format()) +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(
+    title = "PUBLIC: Model Validation",
+    subtitle = "Dashed line = perfect prediction | Black line = actual fit",
+    x = "Predicted Earnings",
+    y = "Actual Earnings"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"), aspect.ratio = 1)
+
+p2 <- ggplot(data_private, aes(x = predicted, y = earnings)) +
+  geom_point(alpha = 0.4, color = institution_colors["Private Nonprofit"], size = 2) +
+  geom_abline(slope = 1, intercept = 0, color = highlight_negative, linetype = "dashed", linewidth = 1.5) +
+  geom_smooth(method = "gam", se = TRUE, color = "black", linewidth = 1) +
+  annotate("text", x = min(data_private$predicted) + 2000, y = max(data_private$earnings) - 5000,
+           label = paste0("R² = ", round(private_rsq, 3)),
+           hjust = 0, vjust = 1, size = 5, fontface = "bold", color = institution_colors["Private Nonprofit"]) +
+  scale_x_continuous(labels = dollar_format()) +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(
+    title = "PRIVATE: Model Validation",
+    subtitle = "Dashed line = perfect prediction | Black line = actual fit",
+    x = "Predicted Earnings",
+    y = "Actual Earnings"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"), aspect.ratio = 1)
+
+p1 | p2
+```
+
+```{r Performance Metrics}
+public_rsq <- cor(data_public$earnings, data_public$predicted)^2
+public_rmse <- sqrt(mean(data_public$residual^2))
+public_mae <- mean(abs(data_public$residual))
+public_mape <- mean(abs(data_public$residual / data_public$earnings)) * 100
+
+private_rsq <- cor(data_private$earnings, data_private$predicted)^2
+private_rmse <- sqrt(mean(data_private$residual^2))
+private_mae <- mean(abs(data_private$residual))
+private_mape <- mean(abs(data_private$residual / data_private$earnings)) * 100
+
+performance_table <- tibble(
+  Metric = c("R² (Variance Explained)", "RMSE (Avg $ Error)", 
+             "MAE (Typical $ Error)", "MAPE (Avg % Error)"),
+  Public = c(round(public_rsq, 3), dollar(round(public_rmse, 0)),
+             dollar(round(public_mae, 0)), paste0(round(public_mape, 1), "%")),
+  Private = c(round(private_rsq, 3), dollar(round(private_rmse, 0)),
+              dollar(round(private_mae, 0)), paste0(round(private_mape, 1), "%"))
+)
+
+kable(
+  performance_table,
+  caption = "Model Performance: Public vs Private Nonprofit GAMs",
+  align = c('l', 'r', 'r')
+)
+```
+
+Our public model achieves R²=0.216 (explaining 21.6% of earnings variance) with typical errors around $5,079 (MAE). The private model achieves R²=0.185 with MAE=$9,376. While these R² values might seem modest, they represent only one-year earnings predictions using just two institutional characteristics. This also suggests that a majority of the variance comes from factors we don't measure like field of study, geographic location, career path choices, etc. What the above model captures is the portion of earnings attributable to institutional debt levels and completion effectiveness.
+
+### 5.2 The Earnings Landscape: Contour Plots
+
+```{r Public Contour Plot, fig.width=5.8, fig.height=3.5}
+# PROFESSOR FEEDBACK: Round numbers on contours
+
+public_contour_grid <- expand.grid(
+  log_debt = seq(log(10000), log(30000), length.out = 500),
+  grad_rate = seq(0.30, 0.90, length.out = 500)
+)
+
+public_contour_grid$log_earnings_pred <- predict(gam_public_int, newdata = public_contour_grid)
+public_contour_grid$earnings_pred <- exp(public_contour_grid$log_earnings_pred)
+public_contour_grid$debt <- exp(public_contour_grid$log_debt)
+
+# Create breaks at $2,500 intervals
+breaks_public <- seq(30000, 55000, by = 2500)
+
+ggplot(public_contour_grid, aes(x = debt, y = grad_rate)) +
+  geom_contour_filled(aes(z = earnings_pred), breaks = breaks_public) +
+  scale_fill_viridis_d(
+    option = "inferno",
+    name = "Predicted\nEarnings"
+  ) +
+  scale_x_continuous(labels = dollar_format(), breaks = seq(10000, 30000, by = 5000)) +
+  scale_y_continuous(labels = percent_format(), breaks = seq(0.3, 0.9, by = 0.1)) +
+  labs(
+    title = "PUBLIC INSTITUTIONS: Predicted Earnings Landscape",
+    subtitle = "Contours at $2,500 intervals",
+    x = "Median Debt at Graduation",
+    y = "Graduation Rate"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    plot.title = element_text(face = "bold", size = 12),
+    legend.position = "right",
+    panel.grid.minor = element_blank()
+  )
+```
+
+This contour map reveals the predicted earnings landscape for public universities and shows a vertical stratification (contour lines run nearly horizontal), meaning earnings change dramatically as you move up in graduation rate but modestly as you move right in debt. A student moving from a 40% to 80% graduation-rate public school gains approximately $15,000 in predicted earnings, even if debt increases from $15K to $25K. The highest earnings zone (bright yellow, $50K-$55K) occurs at high graduation rates with low to moderate debt. There's a 'valley' around 40-50% graduation rates where earnings dip regardless of debt; these mid-tier schools with low completion rates produce the weakest returns. The jagged contours and multiple local peaks reflect the interaction model capturing complex, non-monotonic patterns that simpler models would miss.
+
+```{r Private Contour Plot, fig.width=5.8, fig.height=3.5}
+private_contour_grid <- expand.grid(
+  log_debt = seq(log(10000), log(30000), length.out = 500),
+  grad_rate = seq(0.30, 0.90, length.out = 500)
+)
+
+private_contour_grid$log_earnings_pred <- predict(gam_private_bs, newdata = private_contour_grid)
+private_contour_grid$earnings_pred <- exp(private_contour_grid$log_earnings_pred)
+private_contour_grid$debt <- exp(private_contour_grid$log_debt)
+
+# Create breaks at $3,000 intervals
+breaks_private <- seq(35000, 65000, by = 3000)
+
+ggplot(private_contour_grid, aes(x = debt, y = grad_rate)) +
+  geom_contour_filled(aes(z = earnings_pred), breaks = breaks_private) +
+  scale_fill_viridis_d(
+    option = "inferno",
+    name = "Predicted\nEarnings"
+  ) +
+  scale_x_continuous(labels = dollar_format(), breaks = seq(10000, 30000, by = 5000)) +
+  scale_y_continuous(labels = percent_format(), breaks = seq(0.3, 0.9, by = 0.1)) +
+  labs(
+    title = "PRIVATE NONPROFIT: Predicted Earnings Landscape",
+    subtitle = "Contours at $3,000 intervals",
+    x = "Median Debt at Graduation",
+    y = "Graduation Rate"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    plot.title = element_text(face = "bold", size = 12),
+    legend.position = "right",
+    panel.grid.minor = element_blank()
+  )
+```
+
+The private nonprofit landscape looks fundamentally different with smoother, more regular contours. Here we see horizontal gradients, where earnings increase substantially with higher debt even when graduation rate stays constant. A private school student with $30K debt at a 60% graduation-rate school is predicted to earn around $47K, while a peer with just $15K debt at an equivalent-quality school earns closer to $41K.
+
+Higher debt at private schools likely signals attendance at more expensive, prestigious institutions with superior resources, networks, and brand name. Higher debt does not cause higher earnings; rather, debt could also correlate with institutional characteristics (selectivity, endowment, alumni networks) that we don't directly measure. The smoother contours reflect our additive model, i.e. debt and graduation rate each contribute independently rather than interacting.
+
+### 5.3 Predicted Debt-Earnings Curves
+
+To make these contour maps concrete, we trace how predicted earnings change with debt at fixed graduation rates.
+
+```{r Public & Private Prediction Lines, fig.width=12, fig.height=6}
+# Public institutions
+public_grad_levels <- c(0.20, 0.40, 0.60, 0.80, 0.90)
+public_grad_labels <- c("20%", "40%", "60%", "80%", "90%")
+public_tier_grid <- expand.grid(
+  grad_rate = public_grad_levels,
+  log_debt = seq(from = min(log(data_public$debt), na.rm = TRUE),
+                 to = max(log(data_public$debt), na.rm = TRUE),
+                 length.out = 200)
+) %>%
+  mutate(grad_label = factor(grad_rate, levels = public_grad_levels, labels = public_grad_labels))
+public_tier_grid$log_earnings_pred <- predict(gam_public_int, newdata = public_tier_grid)
+public_tier_grid <- public_tier_grid %>%
+  mutate(debt = exp(log_debt), earnings_pred = exp(log_earnings_pred))
+
+# Private nonprofit institutions
+private_grad_levels <- c(0.20, 0.40, 0.60, 0.80, 0.90)
+private_grad_labels <- c("20%", "40%", "60%", "80%", "90%")
+private_tier_grid <- expand.grid(
+  grad_rate = private_grad_levels,
+  log_debt = seq(from = min(log(data_private$debt), na.rm = TRUE),
+                 to = max(log(data_private$debt), na.rm = TRUE),
+                 length.out = 200)
+) %>%
+  mutate(grad_label = factor(grad_rate, levels = private_grad_levels, labels = private_grad_labels))
+private_tier_grid$log_earnings_pred <- predict(gam_private_bs, newdata = private_tier_grid)
+private_tier_grid <- private_tier_grid %>%
+  mutate(debt = exp(log_debt), earnings_pred = exp(log_earnings_pred))
+
+# Calculate common axis limits
+x_min <- min(c(public_tier_grid$debt, private_tier_grid$debt))
+x_max <- max(c(public_tier_grid$debt, private_tier_grid$debt))
+y_min <- min(c(public_tier_grid$earnings_pred, private_tier_grid$earnings_pred))
+y_max <- max(c(public_tier_grid$earnings_pred, private_tier_grid$earnings_pred))
+
+p1 <- ggplot(public_tier_grid, aes(x = debt, y = earnings_pred, color = grad_label)) +
+  geom_line(linewidth = 1.4) +
+  scale_color_viridis_d(option = "plasma", direction = 1) +
+  scale_x_continuous(labels = dollar_format(), limits = c(x_min, x_max)) +
+  scale_y_continuous(labels = dollar_format(), limits = c(y_min, y_max)) +
+  labs(
+    title = "PUBLIC: Predicted Debt–Earnings Relationship",
+    subtitle = "Each line represents a fixed graduation rate",
+    x = "Median Debt at Graduation",
+    y = "Median Earnings (1 Year After Graduation)",
+    color = "Graduation Rate"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold", size = 14), legend.position = "right")
+
+p2 <- ggplot(private_tier_grid, aes(x = debt, y = earnings_pred, color = grad_label)) +
+  geom_line(linewidth = 1.4) +
+  scale_color_viridis_d(option = "plasma", direction = 1) +
+  scale_x_continuous(labels = dollar_format(), limits = c(x_min, x_max)) +
+  scale_y_continuous(labels = dollar_format(), limits = c(y_min, y_max)) +
+  labs(
+    title = "PRIVATE NONPROFIT: Predicted Debt–Earnings Relationship",
+    subtitle = "Each line represents a fixed graduation rate",
+    x = "Median Debt at Graduation",
+    y = "Median Earnings (1 Year After Graduation)",
+    color = "Graduation Rate"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold", size = 14), legend.position = "right")
+
+# Display side by side
+p1 | p2
+```
+
+For public schools, the curves diverge dramatically by graduation rate. The 90% line (yellow) starts around $50K at low debt and stays relatively flat; these high-quality schools deliver strong outcomes regardless of moderate borrowing. The 40% line (purple) starts low (~$40K) and rises before declining, suggesting students at struggling schools who can't afford any borrowing may not complete degrees, while those with $20-25K debt can finish and see returns. However, beyond $25K debt, returns collapse.
+
+For private nonprofits, all curves follow similar inverted-U shapes, peaking around $15-20K debt regardless of graduation rate. This consistency validates our additive model, i.e. debt operates similarly across quality tiers. But crucially, higher graduation rates shift the entire curve upward by $5-10K, showing quality still matters even if the debt-earnings shape is consistent.
+
+### 5.4 Which Universities Fit Well? Which Don't?
+
+This section captures which schools our model captures well, and where does it fail. This addresses a key concern: are we just fitting noise, or capturing real patterns?
+
+```{r Specific Universities Analysis}
+# PROFESSOR FEEDBACK: Look at particular universities
+
+data_public <- data_public %>%
+  mutate(abs_residual = abs(residual), pct_error = abs(residual / earnings) * 100)
+
+data_private <- data_private %>%
+  mutate(abs_residual = abs(residual), pct_error = abs(residual / earnings) * 100)
+
+# Best fits PUBLIC
+public_best <- data_public %>%
+  arrange(abs_residual) %>%
+  head(5) %>%
+  dplyr::select(name, earnings, predicted, residual, grad_rate, debt) %>%
+  mutate(
+    earnings = dollar(earnings), predicted = dollar(predicted),
+    residual = dollar(residual), grad_rate = percent(grad_rate, accuracy = 0.1),
+    debt = dollar(debt)
+  )
+
+kable(public_best, caption = "PUBLIC: Best Model Fits (Top 5)")
+
+# Worst fits PUBLIC
+public_worst <- data_public %>%
+  arrange(desc(abs_residual)) %>%
+  head(5) %>%
+  dplyr::select(name, earnings, predicted, residual, grad_rate, debt) %>%
+  mutate(
+    earnings = dollar(earnings), predicted = dollar(predicted),
+    residual = dollar(residual), grad_rate = percent(grad_rate, accuracy = 0.1),
+    debt = dollar(debt)
+  )
+
+kable(public_worst, caption = "PUBLIC: Worst Model Fits (Top 5)")
+
+# Best fits PRIVATE
+private_best <- data_private %>%
+  arrange(abs_residual) %>%
+  head(5) %>%
+  dplyr::select(name, earnings, predicted, residual, grad_rate, debt) %>%
+  mutate(
+    earnings = dollar(earnings), predicted = dollar(predicted),
+    residual = dollar(residual), grad_rate = percent(grad_rate, accuracy = 0.1),
+    debt = dollar(debt)
+  )
+
+kable(private_best, caption = "PRIVATE: Best Model Fits (Top 5)")
+
+# Worst fits PRIVATE
+private_worst <- data_private %>%
+  arrange(desc(abs_residual)) %>%
+  head(5) %>%
+  dplyr::select(name, earnings, predicted, residual, grad_rate, debt) %>%
+  mutate(
+    earnings = dollar(earnings), predicted = dollar(predicted),
+    residual = dollar(residual), grad_rate = percent(grad_rate, accuracy = 0.1),
+    debt = dollar(debt)
+  )
+
+kable(private_worst, caption = "PRIVATE: Worst Model Fits (Top 5)")
+```
+
+Our best fits include mainstream universities like Indiana University-Bloomington (public) and Cedarville University (private), schools where debt and graduation rate accurately predict earnings. These schools validate the fact that our models work for typical institutions.
+
+Our worst fits show that we overpredict earnings at the University of North Carolina School of the Arts (predicted $51K, actual $20K). Arts programs produce graduates with low initial earnings despite high graduation rates. We underpredict at Maine Maritime Academy (predicted $41K, actual $94K) and Massachusetts Institute of Technology (predicted $65K, actual $110K). Maritime academies and elite STEM schools produce earnings our general model can't capture because program-specific factors (engineering, maritime careers) dominate.
+
+These outliers aren't failures but reveal that field of study and program specialization matter enormously. Our model only captures what debt and completion rates can explain.
+
+## 6. Conclusions
+
+Analyzing 1,430 four-year U.S. institutions, we find that the relationship between student debt and earnings varies sharply by institutional context, undermining narratives that treat borrowing as uniformly beneficial or harmful.
+
+Key Findings:
+
+1) The debt–earnings relationship is nonlinear and context-dependent. The weak overall correlation masks substantial heterogeneity: when stratified by graduation rates, the association reverses across tiers, indicating that institutional effectiveness critically shapes outcomes.
+
+2) Public and private nonprofit institutions exhibit distinct dynamics. At public institutions, graduation rates dominate earnings outcomes, with higher-quality schools delivering substantially higher earnings even at higher debt levels. In contrast, private nonprofits display flatter debt–earnings relationships, likely reflecting institutional prestige and unobserved resources rather than debt's causal impact.
+
+3) We identify clear risk and opportunity zones. High borrowing at lower- and mid-graduation public institutions is associated with poor outcomes, while moderate debt at high-graduation public schools appears economically justifiable.
+
+These findings reflect associations rather than causal effects. Selection bias and omitted variables, most notably field of study, likely influence observed patterns, particularly at specialized institutions, and should be addressed in future work.
+
+## 7. Limitations
+
+Unmeasured confounding factors dominate: Our models explain only 18-22% of earnings variation. The remaining 78-82% reflects unmeasured factors: field of study (engineering vs humanities differs by $30,000+ annually), student ability, family wealth, geography, and career choices.
+
+Data constraints limit interpretation: We measure only one-year post-graduate earnings for completers, missing long-term trajectories and non-completers (often worst outcomes). We lack program-level data, forcing institution-level analysis that obscures within-school variation.
+
+Causality cannot be established: Students self-select into institutions and debt levels based on unmeasured characteristics. Higher debt at private schools likely reflects selection into prestigious institutions rather than debt's causal effect on earnings.
+
+## 8. Future Scope
+
+Further analysis should account for field of study, as debt–earnings relationships may differ substantially across disciplines and may explain much of the observed institutional variation. Extending the analysis to longer-term earnings would clarify whether short-term patterns persist or change as loan repayment burdens accumulate. Including non-completer data is critical to capture worst-case outcomes for borrowers who incur debt without earning a credential. Finally, incorporating geographic cost-of-living adjustments would distinguish nominal earnings differences from real economic outcomes.
+
+# References
+
+U.S. Department of Education, Federal Student Aid. (n.d.). *Loan Amount Limits*. Retrieved December 9, 2025, from 
+https://studentaid.gov/understand-aid/types/loans/subsidized-unsubsidized
+
+U.S. Department of Education, College Scorecard. (2025). *Most Recent Institution-Level Data*. Retrieved December 9, 2025, from 
+https://collegescorecard.ed.gov/data/
+
+---
+
+# APPENDIX
+
+## Zoomed View: Federal Loan Limit Clustering
+
+```{r Federal Loan Limit Clustering, fig.width=10, fig.height=6}
+debt_zoom <- ggplot(scorecard_complete, aes(x = debt)) +
+  geom_histogram(binwidth = 250, fill = cb_palette[6], alpha = 0.7, color = "white") +
+  geom_vline(xintercept = c(25000, 26000, 27000), 
+             color = highlight_negative, linetype = "dashed", linewidth = 1) +
+  coord_cartesian(xlim = c(20000, 32000)) +
+  scale_x_continuous(labels = dollar_format()) +
+  labs(
+    title = "",
+    x = "Median Debt at Graduation",
+    y = "Number of Institutions"
+  ) +
+  theme_minimal(base_size = 13)
+
+debt_zoom
+```
+
+## Debt Distribution by Institution Type
+
+```{r Three-quarters of private nonprofits cluster at federal limit; Public institutions show lower debt, fig.width=10, fig.height=6}
+ggplot(scorecard_complete, aes(x = debt, fill = control_label)) +
+  geom_histogram(binwidth = 1000, alpha = 0.7, position = "identity", color = "white") +
+  geom_vline(xintercept = 27000, color = highlight_negative, 
+             linetype = "dashed", linewidth = 1) +
+  annotate("text", x = 27000, y = Inf, label = "Federal Limit: $27K", 
+           vjust = 1.5, hjust = -0.1, color = highlight_negative, fontface = "bold") +
+  facet_wrap(~ control_label, ncol = 1, scales = "free_y") +
+  scale_fill_manual(values = institution_colors) +
+  scale_x_continuous(labels = dollar_format()) +
+  labs(
+    title = "",
+    subtitle = "Three-quarters of private nonprofits cluster at federal limit; Public institutions show lower debt",
+    x = "Median Debt at Graduation",
+    y = "Number of Institutions",
+    fill = "Institution Type"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+```
+
+## Debt-Earnings Relationship by Institution Type
+
+```{r Institution Type Patterns, fig.width=10, fig.height=6}
+# PROFESSOR FEEDBACK: Different colors for institution types
+
+ggplot(scorecard_complete, aes(x = debt, y = earnings, color = control_label)) +
+  geom_point(alpha = 0.3, size = 1.5) +
+  geom_smooth(method = "loess", se = TRUE, linewidth = 1.5, alpha = 0.2) +
+  scale_color_manual(values = institution_colors) +
+  scale_fill_manual(values = institution_colors) +
+  scale_x_continuous(labels = dollar_format()) +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(
+    title = "Nonlinear Debt-Earnings Relationship Varies by Institution Type",
+    subtitle = "Separate smooth curves for each institution type",
+    x = "Median Debt at Graduation",
+    y = "Median Earnings (1 Year After)",
+    color = "Institution Type",
+    fill = "Institution Type"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+```
+
+## Why Graduation rate over Region?
+
+```{r Region}
+# Distribution by Region 
+scorecard_complete %>%
+  count(region, name = "Count") %>%
+  mutate(Percentage = (Count / sum(Count)) * 100) %>%
+  kable(
+    col.names = c("Region", "Count", "Percentage (%)"),
+    caption = "Distribution by Region (Final Dataset)",
+    digits = c(0, 0, 1),
+    align = 'lrr'
+  )
+```
+
+```{r Analytical Rationale}
+# Why graduation rate over region
+
+# PUBLIC INSTITUTIONS
+regional_cors_public <- data_public %>%
+  group_by(region) %>%
+  summarise(N = n(), Correlation = round(cor(debt, earnings), 3), .groups = "drop")
+
+grad_cors_public <- data_public %>%
+  group_by(grad_category) %>%
+  summarise(N = n(), Correlation = round(cor(debt, earnings), 3), .groups = "drop")
+
+regional_range_public <- max(regional_cors_public$Correlation) - min(regional_cors_public$Correlation)
+grad_range_public <- max(grad_cors_public$Correlation) - min(grad_cors_public$Correlation)
+
+# PRIVATE INSTITUTIONS
+regional_cors_private <- data_private %>%
+  group_by(region) %>%
+  summarise(N = n(), Correlation = round(cor(debt, earnings), 3), .groups = "drop")
+
+grad_cors_private <- data_private %>%
+  group_by(grad_category) %>%
+  summarise(N = n(), Correlation = round(cor(debt, earnings), 3), .groups = "drop")
+
+regional_range_private <- max(regional_cors_private$Correlation) - min(regional_cors_private$Correlation)
+grad_range_private <- max(grad_cors_private$Correlation) - min(grad_cors_private$Correlation)
+
+# Create summary table
+rationale_table <- tibble(
+  Sector = c("Public", "Private Nonprofit"),
+  `Regional Range` = c(round(regional_range_public, 3), round(regional_range_private, 3)),
+  `Grad Rate Range` = c(round(grad_range_public, 3), round(grad_range_private, 3)),
+  `Ratio (Grad/Region)` = c(
+    paste0(round(grad_range_public / regional_range_public, 1), "×"),
+    paste0(round(grad_range_private / regional_range_private, 1), "×")
+  )
+)
+
+kable(
+  rationale_table,
+  caption = "Why Focus on Graduation Rate: Variation in Debt-Earnings Correlation",
+  align = c('l', 'r', 'r', 'r')
+)
+```
+
+## Comparing Linear vs Nonlinear Approaches
+
+```{r Linear vs GAM Comparison, fig.width=12, fig.height=5}
+
+p_linear <- ggplot(scorecard_complete, aes(x = debt, y = earnings)) +
+  geom_point(alpha = 0.3, color = "gray50", size = 1.5) +
+  geom_smooth(method = "lm", se = TRUE, 
+              color = trend_colors["Linear (LM)"], 
+              fill = trend_colors["Linear (LM)"],
+              alpha = 0.2, linewidth = 1.5) +
+  scale_x_continuous(labels = dollar_format()) +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(
+    title = "A. Linear Model (LM)",
+    subtitle = "Linear relationship between predictors and outcome",
+    x = "Median Debt at Graduation",
+    y = "Median Earnings (1 Year After)"
+  ) +
+  theme_minimal(base_size = 12)
+
+p_gam <- ggplot(scorecard_complete, aes(x = debt, y = earnings)) +
+  geom_point(alpha = 0.3, color = "gray50", size = 1.5) +
+  geom_smooth(method = "gam", se = TRUE,
+              color = trend_colors["Flexible (GAM)"],
+              fill = trend_colors["Flexible (GAM)"],
+              alpha = 0.2, linewidth = 1.5) +
+  scale_x_continuous(labels = dollar_format()) +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(
+    title = "B. Nonlinear Model (GAM)",
+    subtitle = "Flexible smooth functions of predictors",
+    x = "Median Debt at Graduation",
+    y = "Median Earnings (1 Year After)"
+  ) +
+  theme_minimal(base_size = 12)
+
+p_linear | p_gam
+```
+
+## Model Complexity table  (degrees of freedom)
+
+```{r Model Complexity}
+edf_comparison <- data.frame(
+  Model = c("Public (Interaction)", "Private (Both Smooth)"),
+  `Total EDF` = c(sum(gam_public_int$edf), sum(gam_private_bs$edf)),
+  `Sample Size` = c(nrow(data_public), nrow(data_private)),
+  `EDF per 100 obs` = c(sum(gam_public_int$edf) / nrow(data_public) * 100, 
+                        sum(gam_private_bs$edf) / nrow(data_private) * 100),
+  check.names = FALSE
+)
+
+kable(
+  edf_comparison,
+  caption = "Model Complexity: Effective Degrees of Freedom (EDF)",
+  digits = c(0, 1, 0, 2),
+  align = c('l', 'r', 'r', 'r')
+)
+```
+
+
+## Residual Plots
+
+```{r Residual Diagnostics - APPENDIX, fig.width=12, fig.height=10}
+r1 <- ggplot(data_public, aes(x = predicted, y = residual)) +
+  geom_point(alpha = 0.4, color = institution_colors["Public"]) +
+  geom_hline(yintercept = 0, color = highlight_negative, linewidth = 1, linetype = "dashed") +
+  geom_smooth(se = TRUE, color = "black", linewidth = 1) +
+  scale_x_continuous(labels = dollar_format()) +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(title = "A. PUBLIC: Residual Plot", x = "Predicted Earnings", y = "Residuals") +
+  theme_minimal(base_size = 11)
+
+r2 <- ggplot(data_private, aes(x = predicted, y = residual)) +
+  geom_point(alpha = 0.4, color = institution_colors["Private Nonprofit"]) +
+  geom_hline(yintercept = 0, color = highlight_negative, linewidth = 1, linetype = "dashed") +
+  geom_smooth(se = TRUE, color = "black", linewidth = 1) +
+  scale_x_continuous(labels = dollar_format()) +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(title = "B. PRIVATE: Residual Plot", x = "Predicted Earnings", y = "Residuals") +
+  theme_minimal(base_size = 11)
+
+r3 <- ggplot(data_public, aes(x = residual)) +
+  geom_histogram(bins = 40, fill = institution_colors["Public"], alpha = 0.7, color = "white") +
+  geom_vline(xintercept = 0, color = highlight_negative, linewidth = 1, linetype = "dashed") +
+  scale_x_continuous(labels = dollar_format()) +
+  labs(title = "C. PUBLIC: Residual Distribution", x = "Residuals", y = "Count") +
+  theme_minimal(base_size = 11)
+
+r4 <- ggplot(data_private, aes(x = residual)) +
+  geom_histogram(bins = 40, fill = institution_colors["Private Nonprofit"], alpha = 0.7, color = "white") +
+  geom_vline(xintercept = 0, color = highlight_negative, linewidth = 1, linetype = "dashed") +
+  scale_x_continuous(labels = dollar_format()) +
+  labs(title = "D. PRIVATE: Residual Distribution", x = "Residuals", y = "Count") +
+  theme_minimal(base_size = 11)
+
+(r1 | r2) / (r3 | r4)
+```
+
+## Full model summaries
+
+```{r Appendix Full Model Summaries}
+# PUBLIC MODEL SUMMARY
+summary(gam_public_int)
+
+# PRIVATE MODEL SUMMARY  
+summary(gam_private_bs)
+```
+
+## Unmeasured Confounding Variables 
+
+```{r Confounding Analysis, fig.width=12, fig.height=6}
+# PROFESSOR FEEDBACK: What confounders drive the relationship?
+# Focus on the most critical unmeasured variables
+
+# 1. Tuition as institutional resource proxy
+p_tuition <- ggplot(scorecard_complete, aes(x = tuition, y = earnings, color = control_label)) +
+  geom_point(alpha = 0.4, size = 1.5) +
+  geom_smooth(method = "loess", se = FALSE, linewidth = 1.2) +
+  scale_color_manual(values = institution_colors) +
+  scale_x_continuous(labels = dollar_format()) +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(
+    title = "Tuition vs Earnings by Institution Type",
+    subtitle = "Relationship between tuition and median earnings one year after graduation",
+    x = "In-State Tuition", 
+    y = "Median Earnings", 
+    color = "Institution Type"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+
+# 2. Pell percentage as student SES proxy
+p_pell <- ggplot(scorecard_complete, aes(x = pct_pell, y = earnings, color = control_label)) +
+  geom_point(alpha = 0.4, size = 1.5) +
+  geom_smooth(method = "loess", se = FALSE, linewidth = 1.2) +
+  scale_color_manual(values = institution_colors) +
+  scale_x_continuous(labels = percent_format()) +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(
+    title = "Pell Recipients vs Earnings by Institution Type",
+    subtitle = "Relationship between low-income student percentage and median earnings",
+    x = "Percentage of Students Receiving Pell Grants", 
+    y = "Median Earnings", 
+    color = "Institution Type"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+
+p_tuition | p_pell
+```
+
+## Outlier Visualization
+
+```{r Outlier Visualization, fig.width=12, fig.height=8}
+# Show only TOP 5 WORST FITTING universities (cleaner visualization)
+data_public_labeled <- data_public %>%
+  arrange(desc(abs_residual)) %>%
+  mutate(
+    label = ifelse(row_number() <= 5, name, ""),
+    is_outlier = row_number() <= 5
+  )
+
+data_private_labeled <- data_private %>%
+  arrange(desc(abs_residual)) %>%
+  mutate(
+    label = ifelse(row_number() <= 5, name, ""),
+    is_outlier = row_number() <= 5
+  )
+
+p_public_outliers <- ggplot(data_public_labeled, aes(x = predicted, y = earnings)) +
+  geom_abline(slope = 1, intercept = 0, color = highlight_negative, linetype = "dashed", linewidth = 1) +
+  geom_point(aes(color = is_outlier), alpha = 0.5, size = 2) +
+  geom_text_repel(
+    aes(label = label), 
+    size = 3.5, 
+    max.overlaps = 20,
+    box.padding = 0.5,
+    point.padding = 0.3,
+    force = 2
+  ) +
+  scale_color_manual(values = c("gray60", highlight_negative)) +
+  scale_x_continuous(labels = dollar_format()) +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(
+    title = "PUBLIC: Model Fit with Top 5 Worst Fits Labeled",
+    subtitle = "Universities with largest prediction errors",
+    x = "Predicted Earnings",
+    y = "Actual Earnings"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none")
+
+p_private_outliers <- ggplot(data_private_labeled, aes(x = predicted, y = earnings)) +
+  geom_abline(slope = 1, intercept = 0, color = highlight_negative, linetype = "dashed", linewidth = 1) +
+  geom_point(aes(color = is_outlier), alpha = 0.5, size = 2) +
+  geom_text_repel(
+    aes(label = label), 
+    size = 3.5, 
+    max.overlaps = 20,
+    box.padding = 0.5,
+    point.padding = 0.3,
+    force = 2
+  ) +
+  scale_color_manual(values = c("gray60", highlight_negative)) +
+  scale_x_continuous(labels = dollar_format()) +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(
+    title = "PRIVATE: Model Fit with Top 5 Worst Fits Labeled",
+    subtitle = "Universities with largest prediction errors",
+    x = "Predicted Earnings",
+    y = "Actual Earnings"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none")
+
+p_public_outliers | p_private_outliers
+```
+
+---
+
+# Generative AI Use
+
+**AI assistance statement.** We used OpenAI ChatGPT, Google Gemini, and Anthropic Claude for R code syntax generation and minor text edits; all analysis decisions and interpretations are our own.
